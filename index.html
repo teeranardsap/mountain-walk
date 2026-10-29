@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mountain Walk — three.js terrain</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1020; }
+  #overlay {
+    position: fixed; inset: 0; z-index: 10; display: flex;
+    align-items: center; justify-content: center;
+    background: rgba(8, 12, 24, 0.55);
+    color: #eef3fa; font: 15px/1.7 system-ui, sans-serif;
+    cursor: pointer; text-align: center;
+  }
+  #overlay.hidden { display: none; }
+  #overlay h1 { font-size: 26px; margin: 0 0 10px; }
+  kbd {
+    background: #1d2740; border: 1px solid #3a4a70; border-bottom-width: 2px;
+    border-radius: 4px; padding: 1px 8px; font-family: inherit;
+  }
+  #crosshair {
+    position: fixed; left: 50%; top: 50%; margin: -3px 0 0 -3px; z-index: 5;
+    width: 6px; height: 6px; border-radius: 50%;
+    background: rgba(255,255,255,.85); box-shadow: 0 0 0 1px rgba(0,0,0,.4);
+    pointer-events: none;
+  }
+  #hud {
+    position: fixed; left: 12px; bottom: 10px; z-index: 5;
+    color: #cfe0f2; font: 12px/1.5 ui-monospace, monospace; opacity: .8;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <div>
+    <h1>🏔️ Mountain Walk</h1>
+    <div>
+      <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> เดิน &nbsp;·&nbsp;
+      <kbd>Shift</kbd> วิ่ง &nbsp;·&nbsp; เมาส์ = มองรอบตัว<br>
+      คลิกที่หน้าจอเพื่อเริ่ม · <kbd>Esc</kbd> ยกเลิกล็อกเมาส์
+    </div>
+  </div>
+</div>
+<div id="crosshair"></div>
+<div id="hud"></div>
+
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+
+/* ================= noise (value noise + fBm) ================= */
+const fract = n => n - Math.floor(n);
+const hash2 = (x, y) => fract(Math.sin(x * 127.1 + y * 311.7) * 43758.5453123);
+
+function smoothNoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf);
+  const v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi),     b = hash2(xi + 1, yi);
+  const c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+
+function fbm(x, y, oct = 5) {
+  let h = 0, amp = 0.5, freq = 1, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    h += smoothNoise(x * freq, y * freq) * amp;
+    norm += amp; amp *= 0.5; freq *= 2;
+  }
+  return h / norm;
+}
+
+function ridged(x, y, oct = 5) {
+  let h = 0, amp = 0.5, freq = 1, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    const n = 1 - Math.abs(2 * smoothNoise(x * freq, y * freq) - 1);
+    h += n * n * amp;
+    norm += amp; amp *= 0.5; freq *= 2;
+  }
+  return h / norm;
+}
+
+/* ================= terrain ================= */
+const TERRAIN_SIZE = 240;
+const TERRAIN_SEG  = 256;
+
+function terrainHeight(x, z) {
+  const base = fbm(x * 0.013 + 37.2, z * 0.013 + 91.7, 4);  // rolling hills 0..1
+  const mnt  = ridged(x * 0.0075, z * 0.0075, 5);           // ridged peaks 0..1
+  const bump = fbm(x * 0.031 + 5.5, z * 0.031 + 8.8, 3);
+  return base * 6 + Math.pow(mnt, 1.6) * 46 + bump * 3 * mnt;
+}
+
+/* spawn = lowest decent spot near the centre */
+let spawnX = 0, spawnZ = 0, best = Infinity;
+for (let gx = -50; gx <= 50; gx += 3)
+  for (let gz = -50; gz <= 50; gz += 3) {
+    const h = terrainHeight(gx, gz);
+    if (h > 2 && h < best) { best = h; spawnX = gx; spawnZ = gz; }
+  }
+
+/* ---- terrain mesh: one plane, displaced + vertex-coloured by height ---- */
+const geo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEG, TERRAIN_SEG);
+geo.rotateX(-Math.PI / 2);
+const pos = geo.attributes.position;
+for (let i = 0; i < pos.count; i++) {
+  pos.setY(i, terrainHeight(pos.getX(i), pos.getZ(i)));
+}
+geo.computeVertexNormals();
+
+const cGrassA = new THREE.Color(0x37682c);
+const cGrassB = new THREE.Color(0x5d9c3f);
+const cRock   = new THREE.Color(0x87806f);
+const cSnow   = new THREE.Color(0xf4f7fb);
+const tmpCol  = new THREE.Color();
+
+function groundColor(h, x, z, out) {
+  if (h < 14)            out.copy(cGrassA).lerp(cGrassB, THREE.MathUtils.smoothstep(h, 3, 13));
+  else if (h < 26)       out.copy(cGrassB).lerp(cRock,  THREE.MathUtils.smoothstep(h, 15, 26));
+  else if (h < 38)       out.copy(cRock);
+  else                   out.copy(cRock).lerp(cSnow, THREE.MathUtils.smoothstep(h, 37, 44));
+  const v = hash2(x * 0.173 + 11.7, z * 0.231 + 5.1);
+  out.multiplyScalar(0.88 + 0.24 * v);
+}
+
+const colors = new Float32Array(pos.count * 3);
+for (let i = 0; i < pos.count; i++) {
+  groundColor(pos.getY(i), pos.getX(i), pos.getZ(i), tmpCol);
+  colors[i * 3]     = tmpCol.r;
+  colors[i * 3 + 1] = tmpCol.g;
+  colors[i * 3 + 2] = tmpCol.b;
+}
+geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+const terrain = new THREE.Mesh(
+  geo,
+  new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 1, metalness: 0 })
+);
+terrain.receiveShadow = true;
+
+/* ================= scene / renderer ================= */
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0xcfe6f5, 70, 260);
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 600);
+camera.rotation.order = 'YXZ';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+scene.add(terrain);
+
+/* ---- sky dome (basic sphere, gradient shader) ---- */
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(400, 16, 12),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    depthWrite: false,
+    uniforms: {
+      top:    { value: new THREE.Color(0x2f6bb5) },
+      bottom: { value: new THREE.Color(0xcfe6f5) },
+    },
+    vertexShader: `
+      varying vec3 vP;
+      void main() { vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+    `,
+    fragmentShader: `
+      uniform vec3 top; uniform vec3 bottom; varying vec3 vP;
+      void main() {
+        float t = clamp(vP.y / 200.0, 0.0, 1.0);
+        t = pow(t, 0.6);
+        gl_FragColor = vec4(mix(bottom, top, t), 1.0);
+      }
+    `,
+  })
+);
+scene.add(sky);
+
+/* ---- lights ---- */
+const sun = new THREE.DirectionalLight(0xfff2d8, 2.5);
+sun.position.set(80, 120, 60);
+sun.castShadow = true;
+sun.shadow.camera.left = -150;
+sun.shadow.camera.right = 150;
+sun.shadow.camera.top = 150;
+sun.shadow.camera.bottom = -150;
+sun.shadow.camera.near = 10;
+sun.shadow.camera.far = 400;
+sun.shadow.mapSize.set(2048, 2048);
+scene.add(sun);
+scene.add(sun.target);
+scene.add(new THREE.HemisphereLight(0xbfd9ff, 0x3a5a2a, 0.7));
+
+/* ---- tree species (spec-driven, instanced) ----
+   Each species = list of basic-geometry parts (baked rot/scale/pos into the
+   geometry) + placement band. Parts are InstancedMeshes; per-instance colour
+   jitter via setColorAt (material colour stays white).                    */
+function makePartGeometry(part) {
+  let g;
+  switch (part.geo) {
+    case 'box':         g = new THREE.BoxGeometry(...part.args); break;
+    case 'cylinder':    g = new THREE.CylinderGeometry(...part.args); break;
+    case 'cone':        g = new THREE.ConeGeometry(...part.args); break;
+    case 'icosahedron': g = new THREE.IcosahedronGeometry(...part.args); break;
+    case 'sphere':      g = new THREE.SphereGeometry(...part.args); break;
+    default: throw new Error('unknown geo: ' + part.geo);
+  }
+  if (part.rot) { g.rotateX(part.rot[0]); g.rotateY(part.rot[1]); g.rotateZ(part.rot[2]); }
+  if (part.scale !== undefined) {
+    const s = Array.isArray(part.scale) ? part.scale : [part.scale, part.scale, part.scale];
+    g.scale(s[0], s[1], s[2]);
+  }
+  if (part.pos) g.translate(part.pos[0], part.pos[1], part.pos[2]);
+  return g;
+}
+
+function plantSpecies(spec) {
+  const P = spec.placement;
+  const meshes = spec.parts.map(p => {
+    const g = makePartGeometry(p);
+    const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, flatShading: true, roughness: 1 });
+    const im = new THREE.InstancedMesh(g, mat, P.count);
+    im.castShadow = true;
+    im.receiveShadow = true;
+    im.frustumCulled = false;
+    scene.add(im);
+    return im;
+  });
+  const baseColors = spec.parts.map(p => new THREE.Color(p.color));
+  const d = new THREE.Object3D();
+  const c = new THREE.Color();
+  let placed = 0, tries = 0;
+  const B = TERRAIN_SIZE / 2 - 12;
+  while (placed < P.count && tries < P.count * 60) {
+    tries++;
+    const a = Math.random() * Math.PI * 2;
+    const r = 10 + Math.random() * (B - 10);
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    const h = terrainHeight(x, z);
+    if (h < P.minH || h > P.maxH) continue;                     // altitude band
+    if (Math.hypot(x - spawnX, z - spawnZ) < 8) continue;      // keep spawn clear
+    const slope = Math.abs(terrainHeight(x + 2, z) - terrainHeight(x - 2, z))
+                + Math.abs(terrainHeight(x, z + 2) - terrainHeight(x, z - 2));
+    if (slope > P.slopeMax) continue;                          // no trees on cliffs
+    d.position.set(x, h - 0.12, z);
+    d.rotation.set(0, Math.random() * Math.PI * 2, 0);
+    d.scale.setScalar(P.scaleMin + Math.random() * (P.scaleMax - P.scaleMin));
+    d.updateMatrix();
+    for (let i = 0; i < meshes.length; i++) meshes[i].setMatrixAt(placed, d.matrix);
+    spec.parts.forEach((p, i) => {
+      c.copy(baseColors[i]);
+      if (p.jitter) c.offsetHSL(0, 0, (Math.random() - 0.5) * 2 * p.jitter);
+      meshes[i].setColorAt(placed, c);
+    });
+    placed++;
+  }
+  for (const im of meshes) {
+    im.count = placed;
+    im.instanceMatrix.needsUpdate = true;
+    if (im.instanceColor) im.instanceColor.needsUpdate = true;
+  }
+  return placed;
+}
+
+const TREE_SPECS = [
+  /* spruce — mid slopes (original) */
+  {
+    id: 'pine',
+    placement: { minH: 5, maxH: 26, slopeMax: 7, count: 500, scaleMin: 1, scaleMax: 2.3 },
+    parts: [
+      { geo: 'cylinder', args: [0.12, 0.2, 1.2, 6], pos: [0, 0.6, 0], color: '#6b4a2a', jitter: 0.08 },
+      { geo: 'cone', args: [1.15, 2.0, 7], pos: [0, 1.6, 0], color: '#2e6b39', jitter: 0.10 },
+      { geo: 'cone', args: [0.85, 1.8, 7], pos: [0, 2.7, 0], color: '#2a6434', jitter: 0.10 },
+      { geo: 'cone', args: [0.55, 1.6, 7], pos: [0, 3.8, 0], color: '#275e31', jitter: 0.10 },
+    ],
+  },
+  /* broadleaf oak — low grass band */
+  {
+    id: 'oak',
+    placement: { minH: 3, maxH: 13, slopeMax: 6, count: 90, scaleMin: 0.8, scaleMax: 1.5 },
+    parts: [
+      { geo: 'cylinder', args: [0.22, 0.4, 3.2, 6], pos: [0, 1.6, 0], rot: [0, 0, 0.03], color: '#5b4022', jitter: 0.08 },
+      { geo: 'cylinder', args: [0.05, 0.11, 0.85, 5], pos: [0.28, 2.75, 0.12], rot: [0, 0, -1.1], color: '#543b1e', jitter: 0.08 },
+      { geo: 'cylinder', args: [0.05, 0.1, 0.75, 5], pos: [-0.22, 2.5, -0.18], rot: [0, 0, 0.9], color: '#61441f', jitter: 0.08 },
+      { geo: 'icosahedron', args: [1.6, 0], pos: [0, 4.6, 0], scale: 1.0, color: '#4e8a2f', jitter: 0.15 },
+      { geo: 'icosahedron', args: [1.3, 0], pos: [1.1, 4.2, 0.4], color: '#5a9a35', jitter: 0.15 },
+      { geo: 'icosahedron', args: [1.1, 0], pos: [-0.9, 4.0, -0.3], color: '#457c28', jitter: 0.15 },
+      { geo: 'icosahedron', args: [0.9, 0], pos: [0.3, 5.6, -0.2], color: '#63a83e', jitter: 0.18 },
+    ],
+  },
+  /* acacia umbrella — mid slopes, dry look */
+  {
+    id: 'umbrella',
+    placement: { minH: 10, maxH: 22, slopeMax: 5, count: 80, scaleMin: 0.9, scaleMax: 1.6 },
+    parts: [
+      { geo: 'cylinder', args: [0.16, 0.3, 5.5, 6], pos: [0, 2.75, 0], color: '#6e4a26', jitter: 0.08 },
+      { geo: 'icosahedron', args: [3.4, 0], pos: [0, 5.55, 0], scale: [1.0, 0.26, 1.0], color: '#7c8a3e', jitter: 0.12 },
+      { geo: 'icosahedron', args: [2.0, 0], pos: [1.9, 5.3, 0.5], scale: [1.0, 0.24, 1.0], color: '#85904a', jitter: 0.12 },
+      { geo: 'icosahedron', args: [1.8, 0], pos: [-1.6, 5.25, -1.0], scale: [1.0, 0.25, 1.0], color: '#747f38', jitter: 0.12 },
+      { geo: 'icosahedron', args: [1.2, 0], pos: [0.3, 5.85, -0.4], scale: [1.0, 0.3, 1.0], color: '#8a9150', jitter: 0.12 },
+    ],
+  },
+  /* alpine dwarf pine — upper slopes below snow line */
+  {
+    id: 'dwarfpine',
+    placement: { minH: 18, maxH: 30, slopeMax: 7, count: 110, scaleMin: 0.75, scaleMax: 1.35 },
+    parts: [
+      { geo: 'cylinder', args: [0.10, 0.18, 0.85, 5], pos: [0.05, 0.425, 0], rot: [0, 0, 0.22], color: '#4a3524', jitter: 0.08 },
+      { geo: 'cone', args: [0.80, 1.0, 6], pos: [0.06, 0.95, 0], rot: [0, 0, 0.10], color: '#1e463a', jitter: 0.10 },
+      { geo: 'cone', args: [0.55, 0.85, 6], pos: [0.16, 1.55, 0], rot: [0, 0, 0.20], color: '#1b4135', jitter: 0.12 },
+      { geo: 'cone', args: [0.38, 0.70, 6], pos: [0.24, 2.15, 0], rot: [0, 0, 0.16], color: '#183b30', jitter: 0.12 },
+      { geo: 'icosahedron', args: [0.32, 0], pos: [0.30, 2.55, 0.03], rot: [0.30, 0.50, 0.14], color: '#16382d', jitter: 0.14 },
+    ],
+  },
+];
+
+const treeCounts = TREE_SPECS.map(s => plantSpecies(s));
+const totalTrees = treeCounts.reduce((a, b) => a + b, 0);
+
+/* ---- low-poly clouds: flattened icosahedrons ---- */
+const cloudMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff, flatShading: true, roughness: 1, transparent: true, opacity: 0.92
+});
+const puffs = [[0, 0, 0, 3], [2.5, 0.4, 0.5, 2.2], [-2.4, 0.3, -0.4, 2.4], [0.8, 0.6, 1.6, 2.0]];
+for (let i = 0; i < 12; i++) {
+  const cloud = new THREE.Group();
+  for (const [px, py, pz, pr] of puffs) {
+    const m = new THREE.Mesh(new THREE.IcosahedronGeometry(pr, 0), cloudMat);
+    m.position.set(px, py, pz);
+    m.scale.y = 0.55;
+    cloud.add(m);
+  }
+  const a = Math.random() * Math.PI * 2;
+  const r = 60 + Math.random() * 120;
+  cloud.position.set(Math.cos(a) * r, 60 + Math.random() * 25, Math.sin(a) * r);
+  cloud.scale.setScalar(1.5 + Math.random() * 2);
+  scene.add(cloud);
+}
+
+/* ================= first-person player ================= */
+const EYE = 1.7;
+const player = {
+  pos: new THREE.Vector3(spawnX, terrainHeight(spawnX, spawnZ) + EYE, spawnZ),
+  yaw: 0, pitch: -0.05,
+  vel: new THREE.Vector3(),
+  walk: 8, run: 14,
+};
+camera.position.copy(player.pos);
+
+const overlay = document.getElementById('overlay');
+const hud = document.getElementById('hud');
+const keys = {};
+
+renderer.domElement.addEventListener('click', () => renderer.domElement.requestPointerLock());
+overlay.addEventListener('click', () => renderer.domElement.requestPointerLock());
+document.addEventListener('pointerlockchange', () => {
+  overlay.classList.toggle('hidden', document.pointerLockElement === renderer.domElement);
+});
+document.addEventListener('mousemove', e => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  player.yaw   -= e.movementX * 0.0022;
+  player.pitch  = THREE.MathUtils.clamp(player.pitch - e.movementY * 0.0022, -1.45, 1.45);
+});
+addEventListener('keydown', e => keys[e.code] = true);
+addEventListener('keyup',   e => keys[e.code] = false);
+
+/* ================= main loop ================= */
+const clock = new THREE.Clock();
+let hudTimer = 0;
+
+function animate() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const locked = document.pointerLockElement === renderer.domElement;
+
+  if (locked) {
+    const f = (keys.KeyW || keys.ArrowUp    ? 1 : 0) - (keys.KeyS || keys.ArrowDown    ? 1 : 0);
+    const s = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft   ? 1 : 0);
+    const sp = keys.ShiftLeft || keys.ShiftRight ? player.run : player.walk;
+
+    const fx = -Math.sin(player.yaw), fz = -Math.cos(player.yaw); // forward
+    const rx =  Math.cos(player.yaw), rz = -Math.sin(player.yaw); // right
+    let mx = fx * f + rx * s, mz = fz * f + rz * s;
+    const len = Math.hypot(mx, mz);
+    if (len > 0) { mx /= len; mz /= len; }
+
+    player.vel.x += mx * 40 * dt;
+    player.vel.z += mz * 40 * dt;
+    const damp = Math.exp(-8 * dt);
+    player.vel.x *= damp;
+    player.vel.z *= damp;
+    const vlen = Math.hypot(player.vel.x, player.vel.z);
+    if (vlen > sp) { player.vel.x *= sp / vlen; player.vel.z *= sp / vlen; }
+
+    player.pos.x += player.vel.x * dt;
+    player.pos.z += player.vel.z * dt;
+
+    const B = TERRAIN_SIZE / 2 - 5;
+    player.pos.x = THREE.MathUtils.clamp(player.pos.x, -B, B);
+    player.pos.z = THREE.MathUtils.clamp(player.pos.z, -B, B);
+
+    const gh = terrainHeight(player.pos.x, player.pos.z);
+    player.pos.y += (gh + EYE - player.pos.y) * Math.min(1, dt * 10); // stick to ground
+  } else {
+    player.vel.set(0, 0, 0);
+  }
+
+  camera.position.copy(player.pos);
+  camera.rotation.x = player.pitch;
+  camera.rotation.y = player.yaw;
+
+  hudTimer += dt;
+  if (hudTimer > 0.25) {
+    hudTimer = 0;
+    hud.textContent =
+      `x ${player.pos.x.toFixed(0)}  z ${player.pos.z.toFixed(0)}  ` +
+      `height ${player.pos.y.toFixed(1)}  ·  trees ${totalTrees}`;
+  }
+
+  renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(animate);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
